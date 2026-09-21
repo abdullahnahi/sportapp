@@ -1,0 +1,613 @@
+import base64
+import csv
+import json
+import math
+import uuid
+from datetime import datetime
+from pathlib import Path
+from statistics import median
+
+import cv2
+import numpy as np
+from flask import Flask, jsonify, render_template_string, request
+from openai import OpenAI
+
+# ============================================================
+# OPENAI CONFIGURATION
+# ============================================================
+# IMPORTANT: Paste a NEW key here, not the key you already shared.
+OPENAI_API_KEY = "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"
+OPENAI_MODEL = "gpt-5.6"
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ============================================================
+# FLASK / STORAGE
+# ============================================================
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 700 * 1024 * 1024
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "sports_uploads"
+RESULT_DIR = BASE_DIR / "sports_results"
+HISTORY_FILE = RESULT_DIR / "history.csv"
+UPLOAD_DIR.mkdir(exist_ok=True)
+RESULT_DIR.mkdir(exist_ok=True)
+
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
+
+# ============================================================
+# SAME THREE SPORTS ONLY
+# ============================================================
+SPORTS = {
+    "javelin": {
+        "label": "Javelin / Arrow",
+        "mass_kg": 0.80,
+        "diameter_m": 0.03,
+        "length_m": 2.60,
+        "release_height_m": 1.80,
+        "drag_coefficient": 0.25,
+        "max_speed_m_s": 40.0,
+    },
+    "shot_put": {
+        "label": "Shot Put",
+        "mass_kg": 7.00,
+        "diameter_m": 0.12,
+        "length_m": 0.12,
+        "release_height_m": 1.40,
+        "drag_coefficient": 0.47,
+        "max_speed_m_s": 20.0,
+    },
+    "discus": {
+        "label": "Discus",
+        "mass_kg": 2.00,
+        "diameter_m": 0.22,
+        "length_m": 0.22,
+        "release_height_m": 1.60,
+        "drag_coefficient": 0.60,
+        "max_speed_m_s": 35.0,
+    },
+}
+
+HISTORY_FIELDS = [
+    "id", "timestamp", "sport", "filename", "fps", "width", "height", "duration_sec",
+    "release_time_sec", "release_frame", "scale_source", "meter_per_pixel",
+    "release_speed_m_s", "release_angle_deg", "physics_distance_m", "correction_factor",
+    "predicted_distance_m", "actual_distance_m", "signed_error_m", "absolute_error_m",
+    "ape_percent", "smape_percent", "accuracy_percent", "confidence_percent",
+    "camera_view", "video_quality"
+]
+
+# ============================================================
+# WEB PAGE
+# ============================================================
+HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Sports Throw Analyzer</title>
+<style>
+:root{--bg:#07111f;--panel:#102033;--panel2:#081523;--accent:#3f9cff;--text:#f2f7ff;--muted:#9fb3ca;--border:#2a405c;--good:#35cf87;--warn:#f3bf57}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#07111f,#102844);color:var(--text);font-family:Segoe UI,Arial,sans-serif}.wrap{max-width:1240px;margin:auto;padding:25px}.hero,.panel{border:1px solid rgba(255,255,255,.07);border-radius:18px}.hero{padding:28px;background:linear-gradient(135deg,#173a60,#1e507f);margin-bottom:18px}.hero h1{margin:0 0 7px}.hero p,.small{color:var(--muted)}.panel{padding:21px;background:rgba(16,32,51,.97);margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:13px}.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:13px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:var(--panel2);border-radius:12px;padding:14px}.card .k{font-size:12px;color:var(--muted)}.card .v{font-size:21px;font-weight:800;margin-top:5px}label{display:block;font-weight:700;margin:5px 0 6px}input,select{width:100%;padding:11px;border-radius:9px;border:1px solid var(--border);background:#071320;color:white}button{border:0;border-radius:10px;padding:12px 17px;color:white;font-weight:700;cursor:pointer}.primary{background:var(--accent)}.secondary{background:#2c4b6e}.tab{background:#24405f}.tab.active{background:var(--accent)}.tabs{display:flex;gap:9px;margin-bottom:17px}.hidden{display:none!important}.status{margin-top:12px;background:#071320;border-radius:9px;padding:11px;color:#d3e6ff}.note{background:#2d2718;border-left:4px solid var(--warn);padding:11px;border-radius:8px;color:#ffe1a0}.good{color:var(--good)}video{width:100%;max-height:480px;background:#000;border-radius:12px}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #29415e;text-align:left;font-size:13px}pre{background:#071320;padding:13px;border-radius:9px;white-space:pre-wrap}.small{font-size:13px;line-height:1.5}@media(max-width:900px){.grid,.grid2{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="hero"><h1>AI Sports Throw Analyzer</h1><p>Javelin / Arrow • Shot Put • Discus — upload video or capture a short live camera sequence.</p></div>
+
+<div class="panel">
+<h2>1. Sport and physical variables</h2>
+<div class="grid">
+<div><label>Sport</label><select id="sport" onchange="applyDefaults()"><option value="javelin">Javelin / Arrow</option><option value="shot_put">Shot Put</option><option value="discus">Discus</option></select></div>
+<div><label>Mass (kg)</label><input id="mass" type="number" step="0.01"></div>
+<div><label>Diameter (m)</label><input id="diameter" type="number" step="0.001"></div>
+<div><label>Length (m)</label><input id="length" type="number" step="0.01"></div>
+<div><label>Release height (m)</label><input id="releaseHeight" type="number" step="0.01"></div>
+<div><label>Drag coefficient</label><input id="drag" type="number" step="0.01"></div>
+</div>
+</div>
+
+<div class="panel">
+<h2>2. Camera calibration</h2>
+<p class="small">Best option: use a visible known distance in the same throwing plane. For example, a marked field segment or the shot-put circle when measured in the image.</p>
+<div class="grid">
+<div><label>Known real distance (m)</label><input id="knownDistance" type="number" step="0.001" placeholder="Example 2.135"></div>
+<div><label>That distance in pixels</label><input id="knownPixels" type="number" step="0.1" placeholder="Example 250"></div>
+<div><label>Direct meter per pixel</label><input id="mpp" type="number" step="0.000001" placeholder="Optional"></div>
+</div>
+<br><label>Actual measured throw distance (optional)</label><input id="actualDistance" type="number" step="0.01" placeholder="Used for accuracy and future sport calibration">
+<div class="note small" style="margin-top:12px">OpenAI vision locates the implement and release phase. Metric speed and distance still depend strongly on camera scale and perspective.</div>
+</div>
+
+<div class="tabs"><button id="upTab" class="tab active" onclick="tab('upload')">Upload Video</button><button id="liveTab" class="tab" onclick="tab('live')">Live Camera</button></div>
+
+<div id="uploadBox" class="panel"><h2>3A. Upload video</h2><input id="videoFile" type="file" accept="video/*"><br><br><button class="primary" onclick="analyzeVideo()">Analyze Throw</button><div id="uploadStatus" class="status">Ready.</div></div>
+
+<div id="liveBox" class="panel hidden"><h2>3B. Live camera</h2><div class="grid2"><div><video id="camera" autoplay playsinline muted></video></div><div><p class="small">Start the camera, then click Capture & Analyze shortly before the throw. The browser captures a short sequence of JPEG frames.</p><button class="secondary" onclick="startCamera()">Start Camera</button> <button class="primary" onclick="captureLive()">Capture & Analyze</button><div id="liveStatus" class="status">Camera not started.</div></div></div></div>
+
+<div id="resultBox" class="panel hidden">
+<h2>4. Result</h2>
+<div class="cards">
+<div class="card"><div class="k">Detected sport</div><div class="v" id="rSport">—</div></div>
+<div class="card"><div class="k">Release time</div><div class="v" id="rTime">—</div></div>
+<div class="card"><div class="k">Release speed</div><div class="v" id="rSpeed">—</div></div>
+<div class="card"><div class="k">Release angle</div><div class="v" id="rAngle">—</div></div>
+<div class="card"><div class="k">Raw physics distance</div><div class="v" id="rPhysics">—</div></div>
+<div class="card"><div class="k">Sport correction</div><div class="v" id="rCorrection">—</div></div>
+<div class="card"><div class="k">Predicted distance</div><div class="v good" id="rPrediction">—</div></div>
+<div class="card"><div class="k">Confidence</div><div class="v" id="rConfidence">—</div></div>
+<div class="card"><div class="k">Actual distance</div><div class="v" id="rActual">—</div></div>
+<div class="card"><div class="k">Absolute error</div><div class="v" id="rError">—</div></div>
+<div class="card"><div class="k">APE</div><div class="v" id="rAPE">—</div></div>
+<div class="card"><div class="k">Prediction accuracy</div><div class="v good" id="rAccuracy">—</div></div>
+</div><h3>Notes</h3><pre id="rNotes"></pre></div>
+
+<div class="panel"><h2>5. Saved validation metrics</h2><button class="secondary" onclick="loadMetrics()">Refresh</button><div style="overflow:auto;margin-top:12px"><table><thead><tr><th>Sport</th><th>N</th><th>MAE</th><th>RMSE</th><th>MAPE</th><th>sMAPE</th><th>Mean accuracy</th><th>Correction</th></tr></thead><tbody id="metricsBody"></tbody></table></div><p class="small">A correction factor is applied only after at least three previous validated throws exist for that sport.</p></div>
+</div>
+
+<script>
+const D={javelin:{mass:.80,diameter:.03,length:2.60,height:1.80,drag:.25},shot_put:{mass:7,diameter:.12,length:.12,height:1.40,drag:.47},discus:{mass:2,diameter:.22,length:.22,height:1.60,drag:.60}};
+function applyDefaults(){const d=D[sport.value];mass.value=d.mass;diameter.value=d.diameter;length.value=d.length;releaseHeight.value=d.height;drag.value=d.drag}applyDefaults();
+function settings(){return{sport:sport.value,mass_kg:+mass.value||0,diameter_m:+diameter.value||0,length_m:+length.value||0,release_height_m:+releaseHeight.value||0,drag_coefficient:+drag.value||0,known_distance_m:+knownDistance.value||0,known_distance_pixels:+knownPixels.value||0,meter_per_pixel:+mpp.value||0,actual_distance_m:+actualDistance.value||0}}
+function tab(t){uploadBox.classList.toggle('hidden',t!=='upload');liveBox.classList.toggle('hidden',t!=='live');upTab.classList.toggle('active',t==='upload');liveTab.classList.toggle('active',t==='live')}
+function fmt(v,d=2,s=''){return(v===null||v===undefined||v===''||Number.isNaN(Number(v)))?'—':Number(v).toFixed(d)+s}
+function showResult(r){resultBox.classList.remove('hidden');rSport.textContent=r.sport_detected_label||r.sport_detected||r.sport;rTime.textContent=fmt(r.release_time_sec,2,' s');rSpeed.textContent=fmt(r.release_speed_m_s,2,' m/s');rAngle.textContent=fmt(r.release_angle_deg,1,'°');rPhysics.textContent=fmt(r.physics_distance_m,2,' m');rCorrection.textContent=fmt(r.correction_factor,3,'×');rPrediction.textContent=fmt(r.predicted_distance_m,2,' m');rConfidence.textContent=fmt(r.confidence_percent,0,'%');rActual.textContent=r.actual_distance_m?fmt(r.actual_distance_m,2,' m'):'Not supplied';rError.textContent=r.absolute_error_m!==null?fmt(r.absolute_error_m,2,' m'):'—';rAPE.textContent=r.ape_percent!==null?fmt(r.ape_percent,1,'%'):'—';rAccuracy.textContent=r.accuracy_percent!==null?fmt(r.accuracy_percent,1,'%'):'—';rNotes.textContent=(r.notes||[]).map(x=>'• '+x).join('\n');resultBox.scrollIntoView({behavior:'smooth'});loadMetrics()}
+async function analyzeVideo(){const f=videoFile.files[0];if(!f){alert('Select a video');return}uploadStatus.textContent='Uploading and analyzing...';const fd=new FormData();fd.append('video',f);fd.append('settings',JSON.stringify(settings()));try{const res=await fetch('/api/analyze-video',{method:'POST',body:fd});const r=await res.json();if(!res.ok)throw new Error(r.error||'Failed');uploadStatus.textContent='Finished.';showResult(r)}catch(e){uploadStatus.textContent='Error: '+e.message}}
+let stream=null;async function startCamera(){stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60}},audio:false});camera.srcObject=stream;liveStatus.textContent='Camera ready.'}
+async function captureLive(){if(!stream)await startCamera();liveStatus.textContent='Capturing about 2.4 seconds...';const c=document.createElement('canvas'),ctx=c.getContext('2d'),frames=[],start=performance.now();for(let i=0;i<16;i++){const ow=camera.videoWidth||1280,oh=camera.videoHeight||720,w=800,h=Math.round(oh*w/ow);c.width=w;c.height=h;ctx.drawImage(camera,0,0,w,h);frames.push({time_sec:(performance.now()-start)/1000,image:c.toDataURL('image/jpeg',.86)});await new Promise(r=>setTimeout(r,150))}liveStatus.textContent='Analyzing...';try{const res=await fetch('/api/analyze-live',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({frames,settings:settings()})});const r=await res.json();if(!res.ok)throw new Error(r.error||'Failed');liveStatus.textContent='Finished.';showResult(r)}catch(e){liveStatus.textContent='Error: '+e.message}}
+async function loadMetrics(){try{const res=await fetch('/api/metrics');const x=await res.json();metricsBody.innerHTML='';for(const k of ['javelin','shot_put','discus']){const m=x[k];metricsBody.innerHTML+=`<tr><td>${m.label}</td><td>${m.n}</td><td>${fmt(m.mae_m)}</td><td>${fmt(m.rmse_m)}</td><td>${fmt(m.mape_percent,1,'%')}</td><td>${fmt(m.smape_percent,1,'%')}</td><td>${fmt(m.mean_accuracy_percent,1,'%')}</td><td>${fmt(m.correction_factor,3,'×')}</td></tr>`}}catch(e){console.log(e)}}loadMetrics();
+</script>
+</body></html>'''
+
+# ============================================================
+# OPENAI JSON SCHEMAS
+# ============================================================
+COARSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sport_detected": {"type": "string", "enum": ["javelin", "shot_put", "discus"]},
+        "release_sample_index": {"type": "integer"},
+        "confidence_percent": {"type": "number"},
+        "camera_view": {"type": "string"},
+        "video_quality": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["sport_detected", "release_sample_index", "confidence_percent", "camera_view", "video_quality", "notes"],
+    "additionalProperties": False,
+}
+
+FINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sport_detected": {"type": "string", "enum": ["javelin", "shot_put", "discus"]},
+        "release_sample_index": {"type": "integer"},
+        "release_angle_deg": {"type": "number"},
+        "confidence_percent": {"type": "number"},
+        "camera_view": {"type": "string"},
+        "video_quality": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "frames": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "object_visible": {"type": "boolean"},
+                    "center_x_norm": {"type": "number"},
+                    "center_y_norm": {"type": "number"},
+                    "bbox_x_norm": {"type": "number"},
+                    "bbox_y_norm": {"type": "number"},
+                    "bbox_w_norm": {"type": "number"},
+                    "bbox_h_norm": {"type": "number"},
+                    "is_after_release": {"type": "boolean"},
+                    "confidence_percent": {"type": "number"},
+                },
+                "required": ["index", "object_visible", "center_x_norm", "center_y_norm", "bbox_x_norm", "bbox_y_norm", "bbox_w_norm", "bbox_h_norm", "is_after_release", "confidence_percent"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["sport_detected", "release_sample_index", "release_angle_deg", "confidence_percent", "camera_view", "video_quality", "notes", "frames"],
+    "additionalProperties": False,
+}
+
+# ============================================================
+# OPENAI / IMAGE HELPERS
+# ============================================================
+def ensure_key():
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "PASTE_YOUR_NEW_OPENAI_API_KEY_HERE":
+        raise RuntimeError("Paste a NEW OpenAI API key into OPENAI_API_KEY at the top of the Python file.")
+
+
+def frame_to_data_url(frame):
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        raise RuntimeError("Could not encode image frame.")
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def decode_data_url(data_url):
+    raw = base64.b64decode(data_url.split(",", 1)[1])
+    frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Could not decode live image.")
+    return frame
+
+
+def openai_vision(frame_records, sport_hint, settings, stage):
+    ensure_key()
+    schema = COARSE_SCHEMA if stage == "coarse" else FINE_SCHEMA
+    if stage == "coarse":
+        instructions = """Analyze these chronological frames from exactly one of three sports: javelin, shot_put, or discus. The selected sport is a strong hint. Find the supplied sample closest to the instant the implement leaves the athlete's hand. For shot put follow the metal ball; for discus follow the discus; for javelin follow the javelin. Return the release sample, confidence, camera view, quality, and notes. Do not invent metric speed or distance."""
+    else:
+        instructions = """Analyze these closely spaced chronological frames around release. The only sports are javelin, shot_put, and discus. For each frame locate only the thrown implement. Use coordinates normalized 0..1000. center_x_norm/y_norm are center coordinates. bbox_x_norm/y_norm are top-left; bbox_w_norm/h_norm are dimensions. object_visible=false if uncertain. is_after_release=true only when the implement is visibly free from the hand. Estimate a 2D release angle above horizontal. Do not invent world-coordinate speed or distance; Python will calculate those from calibration."""
+
+    prompt = f"""{instructions}\nSelected sport: {sport_hint}\nmass_kg={settings.get('mass_kg')}\ndiameter_m={settings.get('diameter_m')}\nlength_m={settings.get('length_m')}\nrelease_height_m={settings.get('release_height_m')}"""
+    content = [{"type": "input_text", "text": prompt}]
+    for rec in frame_records:
+        content.append({"type": "input_text", "text": f"SAMPLE {rec['index']} | time={rec['time_sec']:.4f}s | source_frame={rec.get('frame_index', rec['index'])}"})
+        content.append({"type": "input_image", "image_url": frame_to_data_url(rec["frame"]), "detail": "high"})
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[{"role": "user", "content": content}],
+        text={"format": {"type": "json_schema", "name": "sports_throw_analysis", "strict": True, "schema": schema}},
+    )
+    return json.loads(response.output_text)
+
+# ============================================================
+# VIDEO HELPERS
+# ============================================================
+def video_info(path):
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError("OpenCV could not open the video.")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+    if total <= 0:
+        raise RuntimeError("Video contains no readable frames.")
+    return fps, total, width, height, total / fps
+
+
+def read_frame(cap, index):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+    ok, frame = cap.read()
+    return frame if ok else None
+
+
+def even_frames(path, count=10):
+    fps, total, _, _, _ = video_info(path)
+    indexes = np.linspace(0, total - 1, min(count, total)).astype(int)
+    cap = cv2.VideoCapture(str(path))
+    result = []
+    for i, idx in enumerate(indexes):
+        frame = read_frame(cap, idx)
+        if frame is not None:
+            result.append({"index": i, "frame_index": int(idx), "time_sec": idx / fps, "frame": frame})
+    cap.release()
+    if len(result) < 3:
+        raise RuntimeError("Could not extract enough overview frames.")
+    return result
+
+
+def fine_frames(path, center_time, count=14, window=1.0):
+    fps, total, _, _, duration = video_info(path)
+    start = max(0.0, center_time - window * 0.55)
+    end = min(duration, center_time + window * 0.45)
+    times = np.linspace(start, end, count)
+    cap = cv2.VideoCapture(str(path))
+    result = []
+    for i, t in enumerate(times):
+        idx = max(0, min(total - 1, int(round(t * fps))))
+        frame = read_frame(cap, idx)
+        if frame is not None:
+            result.append({"index": i, "frame_index": idx, "time_sec": idx / fps, "frame": frame})
+    cap.release()
+    return result
+
+# ============================================================
+# POINTS / SCALE / VELOCITY
+# ============================================================
+def ai_points(frame_records, ai, width, height):
+    lookup = {int(r["index"]): r for r in frame_records}
+    result = []
+    for item in ai.get("frames", []):
+        if not item.get("object_visible"):
+            continue
+        src = lookup.get(int(item["index"]))
+        if src is None:
+            continue
+        result.append({
+            "sample_index": int(item["index"]),
+            "frame_index": int(src.get("frame_index", item["index"])),
+            "time_sec": float(src["time_sec"]),
+            "x": float(item["center_x_norm"]) / 1000.0 * width,
+            "y": float(item["center_y_norm"]) / 1000.0 * height,
+            "bbox_w": float(item["bbox_w_norm"]) / 1000.0 * width,
+            "bbox_h": float(item["bbox_h_norm"]) / 1000.0 * height,
+            "after_release": bool(item["is_after_release"]),
+            "confidence": float(item["confidence_percent"]),
+        })
+    return sorted(result, key=lambda p: p["time_sec"])
+
+
+def scale_from_settings(settings, sport, points):
+    direct = float(settings.get("meter_per_pixel") or 0)
+    if direct > 0:
+        return direct, "direct meter_per_pixel"
+    real = float(settings.get("known_distance_m") or 0)
+    pixels = float(settings.get("known_distance_pixels") or 0)
+    if real > 0 and pixels > 0:
+        return real / pixels, "known scene distance"
+
+    sizes = [max(p["bbox_w"], p["bbox_h"]) for p in points if p["bbox_w"] > 2 and p["bbox_h"] > 2]
+    if not sizes:
+        return None, "no metric scale"
+    size_px = float(median(sizes))
+    physical = float(settings.get("length_m") or SPORTS[sport]["length_m"]) if sport == "javelin" else float(settings.get("diameter_m") or SPORTS[sport]["diameter_m"])
+    if physical <= 0 or size_px <= 0:
+        return None, "no metric scale"
+    return physical / size_px, "implement-size fallback"
+
+
+def release_velocity(points, scale, max_speed):
+    if scale is None or len(points) < 3:
+        return None, None
+    after = [p for p in points if p["after_release"]]
+    use = (after if len(after) >= 3 else points)[:7]
+    if len(use) < 3:
+        return None, None
+    t = np.array([p["time_sec"] for p in use], float)
+    x = np.array([p["x"] for p in use], float) * scale
+    y = -np.array([p["y"] for p in use], float) * scale
+    t -= t[0]
+    if t[-1] <= 0:
+        return None, None
+    vx = np.polyfit(t, x, 1)[0]
+    vy = np.polyfit(t, y, 1)[0]
+    speed = float(math.hypot(vx, vy))
+    angle = float(math.degrees(math.atan2(vy, abs(vx))))
+    if speed <= 0 or speed > max_speed * 1.5:
+        return None, None
+    return speed, angle
+
+# ============================================================
+# PHYSICS
+# ============================================================
+def drag_projectile_distance(speed, angle_deg, release_height, mass, diameter, cd):
+    if speed is None or speed <= 0 or release_height <= 0 or mass <= 0 or diameter <= 0:
+        return None
+    g, rho, dt = 9.81, 1.225, 0.002
+    area = math.pi * (diameter / 2.0) ** 2
+    theta = math.radians(angle_deg)
+    vx, vy = abs(speed * math.cos(theta)), speed * math.sin(theta)
+    x, y, elapsed = 0.0, release_height, 0.0
+    prev_x, prev_y = x, y
+    while y >= 0 and elapsed < 20.0:
+        v = math.hypot(vx, vy)
+        if v > 1e-9:
+            drag = 0.5 * rho * cd * area * v * v / mass
+            ax, ay = -drag * vx / v, -g - drag * vy / v
+        else:
+            ax, ay = 0.0, -g
+        prev_x, prev_y = x, y
+        vx += ax * dt
+        vy += ay * dt
+        x += vx * dt
+        y += vy * dt
+        elapsed += dt
+    if y < 0 < prev_y:
+        ratio = prev_y / (prev_y - y)
+        x = prev_x + (x - prev_x) * ratio
+    return max(0.0, float(x))
+
+# ============================================================
+# HISTORY / ACCURACY
+# ============================================================
+def read_history():
+    if not HISTORY_FILE.exists():
+        return []
+    with open(HISTORY_FILE, "r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def num(row, key):
+    try:
+        value = row.get(key, "")
+        return float(value) if value not in ("", None) else None
+    except Exception:
+        return None
+
+
+def correction_factor(sport):
+    ratios = []
+    for row in read_history():
+        if row.get("sport") != sport:
+            continue
+        actual, raw = num(row, "actual_distance_m"), num(row, "physics_distance_m")
+        if actual and raw and raw > 0:
+            ratio = actual / raw
+            if 0.30 < ratio < 3.00:
+                ratios.append(ratio)
+    return float(median(ratios)) if len(ratios) >= 3 else 1.0
+
+
+def error_metrics(actual, predicted):
+    if actual is None or actual <= 0 or predicted is None:
+        return {"signed_error_m": None, "absolute_error_m": None, "ape_percent": None, "smape_percent": None, "accuracy_percent": None}
+    signed = predicted - actual
+    absolute = abs(signed)
+    ape = absolute / actual * 100.0
+    smape = 2.0 * absolute / (abs(actual) + abs(predicted)) * 100.0 if abs(actual) + abs(predicted) > 0 else None
+    return {"signed_error_m": signed, "absolute_error_m": absolute, "ape_percent": ape, "smape_percent": smape, "accuracy_percent": max(0.0, 100.0 - ape)}
+
+
+def save_history(result):
+    exists = HISTORY_FILE.exists()
+    with open(HISTORY_FILE, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({field: result.get(field, "") for field in HISTORY_FIELDS})
+
+
+def aggregate(sport):
+    pairs = []
+    for row in read_history():
+        if row.get("sport") == sport:
+            a, p = num(row, "actual_distance_m"), num(row, "predicted_distance_m")
+            if a and p is not None:
+                pairs.append((a, p))
+    if not pairs:
+        return {"label": SPORTS[sport]["label"], "n": 0, "mae_m": None, "rmse_m": None, "mape_percent": None, "smape_percent": None, "mean_accuracy_percent": None, "correction_factor": correction_factor(sport)}
+    a = np.array([x[0] for x in pairs], float)
+    p = np.array([x[1] for x in pairs], float)
+    e = p - a
+    ae = np.abs(e)
+    ape = ae / a * 100.0
+    smape = 2.0 * ae / (np.abs(a) + np.abs(p)) * 100.0
+    return {
+        "label": SPORTS[sport]["label"], "n": len(pairs),
+        "mae_m": float(ae.mean()), "rmse_m": float(np.sqrt(np.mean(e ** 2))),
+        "mape_percent": float(ape.mean()), "smape_percent": float(smape.mean()),
+        "mean_accuracy_percent": float(np.maximum(0.0, 100.0 - ape).mean()),
+        "correction_factor": correction_factor(sport),
+    }
+
+# ============================================================
+# CORE ANALYSIS
+# ============================================================
+def analyze_sequence(records, settings, metadata, filename, earlier_notes=None):
+    sport = settings.get("sport", "javelin")
+    if sport not in SPORTS:
+        raise ValueError("Sport must be javelin, shot_put, or discus.")
+    defaults = SPORTS[sport]
+    ai = openai_vision(records, sport, settings, "fine")
+    points = ai_points(records, ai, metadata["width"], metadata["height"])
+    if not points:
+        raise RuntimeError("The AI could not confidently locate the thrown implement.")
+
+    after = [p for p in points if p["after_release"]]
+    release = after[0] if after else points[min(len(points) - 1, max(0, int(ai.get("release_sample_index", len(points)//2))))]
+    scale, scale_source = scale_from_settings(settings, sport, points)
+    speed, motion_angle = release_velocity(points, scale, defaults["max_speed_m_s"])
+    ai_angle = float(ai.get("release_angle_deg", 0.0))
+    angle = motion_angle if motion_angle is not None and -10 <= motion_angle <= 80 else ai_angle
+
+    mass = float(settings.get("mass_kg") or defaults["mass_kg"])
+    diameter = float(settings.get("diameter_m") or defaults["diameter_m"])
+    release_height = float(settings.get("release_height_m") or defaults["release_height_m"])
+    cd = float(settings.get("drag_coefficient") or defaults["drag_coefficient"])
+    raw = drag_projectile_distance(speed, angle, release_height, mass, diameter, cd)
+
+    correction = correction_factor(sport)  # previous history only
+    prediction = raw * correction if raw is not None else None
+    actual_value = float(settings.get("actual_distance_m") or 0)
+    actual = actual_value if actual_value > 0 else None
+    errs = error_metrics(actual, prediction)
+
+    confidence = float(ai.get("confidence_percent", 0.0))
+    notes = list(earlier_notes or []) + list(ai.get("notes", []))
+    if scale is None:
+        confidence = min(confidence, 35.0)
+        notes.append("No metric scale was available, so speed and physics distance could not be calculated reliably.")
+    elif scale_source == "implement-size fallback":
+        confidence = min(confidence, 55.0)
+        notes.append("Scale used implement size as a fallback; perspective can cause substantial error.")
+    else:
+        notes.append("User-supplied metric scene calibration was used.")
+    if correction == 1.0:
+        notes.append("Sport correction is 1.000 until at least three previous validated throws exist for this sport.")
+    else:
+        notes.append(f"Historical sport correction {correction:.3f}× was applied.")
+
+    detected = ai.get("sport_detected", sport)
+    result = {
+        "id": uuid.uuid4().hex[:12], "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "sport": sport, "sport_detected": detected, "sport_detected_label": SPORTS.get(detected, defaults)["label"],
+        "filename": filename, "fps": metadata.get("fps"), "width": metadata["width"], "height": metadata["height"], "duration_sec": metadata.get("duration_sec"),
+        "release_time_sec": float(release["time_sec"]), "release_frame": int(release["frame_index"]),
+        "scale_source": scale_source, "meter_per_pixel": scale, "release_speed_m_s": speed,
+        "release_angle_deg": angle, "physics_distance_m": raw, "correction_factor": correction,
+        "predicted_distance_m": prediction, "actual_distance_m": actual, "confidence_percent": confidence,
+        "camera_view": ai.get("camera_view", ""), "video_quality": ai.get("video_quality", ""),
+        "notes": notes, **errs,
+    }
+    save_history(result)  # save only after prediction; no self-leakage
+    return result
+
+
+def analyze_video(path, settings, filename):
+    fps, total, width, height, duration = video_info(path)
+    overview = even_frames(path, 10)
+    coarse = openai_vision(overview, settings.get("sport", "javelin"), settings, "coarse")
+    idx = max(0, min(len(overview) - 1, int(coarse.get("release_sample_index", len(overview)//2))))
+    center_time = overview[idx]["time_sec"]
+    fine = fine_frames(path, center_time, 14, 1.0)
+    return analyze_sequence(fine, settings, {"fps": fps, "width": width, "height": height, "duration_sec": duration}, filename, coarse.get("notes", []))
+
+
+def analyze_live(frame_payload, settings):
+    records = []
+    for i, item in enumerate(frame_payload):
+        frame = decode_data_url(item["image"])
+        records.append({"index": i, "frame_index": i, "time_sec": float(item["time_sec"]), "frame": frame})
+    if len(records) < 5:
+        raise RuntimeError("Not enough live frames.")
+    height, width = records[0]["frame"].shape[:2]
+    duration = records[-1]["time_sec"] - records[0]["time_sec"]
+    fps = (len(records) - 1) / duration if duration > 0 else None
+    return analyze_sequence(records, settings, {"fps": fps, "width": width, "height": height, "duration_sec": duration}, "LIVE_CAMERA")
+
+# ============================================================
+# ROUTES
+# ============================================================
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+@app.route("/api/analyze-video", methods=["POST"])
+def api_analyze_video():
+    try:
+        if "video" not in request.files:
+            return jsonify({"error": "No video uploaded."}), 400
+        video = request.files["video"]
+        original_name = video.filename or "throw.mp4"
+        ext = Path(original_name).suffix.lower()
+        if ext not in ALLOWED_VIDEO_EXTENSIONS:
+            return jsonify({"error": f"Unsupported video type: {ext}"}), 400
+        settings = json.loads(request.form.get("settings", "{}"))
+        saved = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
+        video.save(saved)
+        return jsonify(analyze_video(saved, settings, original_name))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/analyze-live", methods=["POST"])
+def api_analyze_live():
+    try:
+        payload = request.get_json(force=True)
+        return jsonify(analyze_live(payload.get("frames", []), payload.get("settings", {})))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/metrics")
+def api_metrics():
+    return jsonify({sport: aggregate(sport) for sport in SPORTS})
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("AI SPORTS THROW ANALYZER")
+    print("Sports: Javelin / Arrow | Shot Put | Discus")
+    print("Open: http://127.0.0.1:5000")
+    if OPENAI_API_KEY == "PASTE_YOUR_NEW_OPENAI_API_KEY_HERE":
+        print("WARNING: Paste a NEW OpenAI API key at the top of this file.")
+    print("=" * 70)
+    app.run(host="127.0.0.1", port=5000, debug=False)
